@@ -2,10 +2,11 @@ import os
 import sqlite3
 import random
 import vk_api
-from vk_api.longpoll import VkLongPoll, VkEventType
+from vk_api.bot_longpoll import VkBotLongPoll, VkBotEventType
 
-# Токен будет браться из переменной окружения VK_TOKEN на хостинге
+# Токен и ID группы берутся из настроек Infrlo
 TOKEN = os.environ.get("VK_TOKEN")
+GROUP_ID = "242810690" # ID твоего сообщества "Тайный Санта 2027"
 
 # ---------- База данных ----------
 conn = sqlite3.connect("santa.db")
@@ -36,7 +37,7 @@ if not TOKEN:
 
 vk_session = vk_api.VkApi(token=TOKEN)
 vk = vk_session.get_api()
-longpoll = VkLongPoll(vk_session)
+longpoll = VkBotLongPoll(vk_session, GROUP_ID)
 
 def send(uid, text):
     vk.messages.send(user_id=uid, message=text,
@@ -120,7 +121,6 @@ def cmd_draw(uid, gid):
     if len(users) < 2:
         return send(uid, "❌ Нужно минимум 2 участника.")
 
-    # Перемешиваем, пока никто не попадёт сам на себя
     shuffled = users[:]
     for _ in range(200):
         random.shuffle(shuffled)
@@ -129,14 +129,12 @@ def cmd_draw(uid, gid):
     else:
         return send(uid, "❌ Не удалось провести жеребьёвку, попробуй ещё раз.")
 
-    # users[i] дарит подарок shuffled[i]
     for u, t in zip(users, shuffled):
         cur.execute("UPDATE participants SET target_id=? WHERE game_id=? AND user_id=?",
                     (t, gid, u))
     cur.execute("UPDATE games SET status='closed' WHERE id=?", (gid,))
     conn.commit()
 
-    # Рассылка
     for u, t in zip(users, shuffled):
         cur.execute("SELECT wishlist FROM users WHERE vk_id=?", (t,))
         w = cur.fetchone()
@@ -149,11 +147,13 @@ def cmd_draw(uid, gid):
 # ---------- Основной цикл ----------
 print("Бот запущен...")
 for event in longpoll.listen():
-    if event.type != VkEventType.MESSAGE_NEW or not event.to_me:
+    if event.type != VkBotEventType.MESSAGE_NEW:
         continue
-    text = event.text.strip()
+    
+    # Для ботов сообществ текст и ID берутся из объекта message
+    text = event.object.message['text'].strip()
     low = text.lower()
-    uid = event.user_id
+    uid = event.object.message['from_id']
 
     if low.startswith("/start"):
         cmd_start(uid)
