@@ -5,11 +5,12 @@ import vk_api
 from vk_api.bot_longpoll import VkBotLongPoll, VkBotEventType
 
 TOKEN = os.environ.get("VK_TOKEN")
-GROUP_ID = "242810690" # ID твоего сообщества
+GROUP_ID = "242810690"
 
 # ---------- База данных ----------
 conn = sqlite3.connect("santa.db")
 cur = conn.cursor()
+# Добавляем peer_id в таблицу games, чтобы игра привязывалась к конкретному чату
 cur.executescript("""
 CREATE TABLE IF NOT EXISTS users (
     vk_id INTEGER PRIMARY KEY,
@@ -18,6 +19,7 @@ CREATE TABLE IF NOT EXISTS users (
 CREATE TABLE IF NOT EXISTS games (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     creator_id INTEGER,
+    peer_id INTEGER,
     status TEXT DEFAULT 'open'
 );
 CREATE TABLE IF NOT EXISTS participants (
@@ -38,7 +40,6 @@ vk_session = vk_api.VkApi(token=TOKEN)
 vk = vk_session.get_api()
 longpoll = VkBotLongPoll(vk_session, GROUP_ID)
 
-# Отправка сообщения (теперь принимает peer_id, чтобы отвечать и в чат, и в личку)
 def send(peer_id, text):
     vk.messages.send(peer_id=peer_id, message=text,
                      random_id=random.randint(1, 2**31 - 1))
@@ -50,38 +51,62 @@ def get_name(uid):
     except Exception:
         return f"id{uid}"
 
+def get_active_game(peer_id):
+    """Ищет активную игру в текущем чате"""
+    cur.execute("SELECT id FROM games WHERE peer_id = ? AND status = 'open' ORDER BY id DESC LIMIT 1", (peer_id,))
+    row = cur.fetchone()
+    return row[0] if row else None
+
 # ---------- Команды ----------
 def cmd_start(peer_id):
     send(peer_id, "Привет! Я бот «Тайный Санта» 🎅\n\n"
-              "Команды:\n"
-              "/create — создать игру\n"
-              "/join <id> — присоединиться к игре\n"
-              "/wish <текст> — задать пожелания\n"
-              "/my — мои игры\n"
-              "/draw <id> — жеребьёвка (только организатор)\n\n"
-              "В беседах пишите команды с упоминанием бота: @club242810690 /create")
+              "Просто пиши мне обычными словами:\n"
+              "👉 «Создать» — чтобы начать игру\n"
+              "👉 «Участвую» — чтобы записаться\n"
+              "👉 «Хочу [текст]» — чтобы указать пожелания\n"
+              "👉 «Список» — чтобы увидеть участников\n"
+              "👉 «Жеребьевка» — чтобы распределить подарки (только для создателя)\n\n"
+              "Все результаты придут в личные сообщения!")
 
 def cmd_create(peer_id, user_id):
-    cur.execute("INSERT INTO games (creator_id) VALUES (?)", (user_id,))
+    active = get_active_game(peer_id)
+    if active:
+        return send(peer_id, f"⚠️ В этом чате уже есть активная игра #{active}. Если хотите начать новую, сначала проведите жеребьевку в текущей.")
+    
+    cur.execute("INSERT INTO games (creator_id, peer_id) VALUES (?, ?)", (user_id, peer_id))
     gid = cur.lastrowid
     conn.commit()
-    send(peer_id, f"✅ Игра #{gid} создана!\n"
-              f"Пригласи друзей: /join {gid}\n"
-              f"Когда все зайдут — запусти жеребьёвку: /draw {gid}")
+    send(peer_id, f"✅ Игра создана!\nТеперь все желающие могут написать «Участвую».")
 
-def cmd_join(peer_id, user_id, gid):
-    cur.execute("SELECT status FROM games WHERE id=?", (gid,))
-    row = cur.fetchone()
-    if not row:
-        return send(peer_id, "❌ Игра не найдена.")
-    if row[0] != 'open':
-        return send(peer_id, "❌ Игра уже закрыта (жеребьёвка проведена).")
-    cur.execute("INSERT OR IGNORE INTO participants (game_id, user_id) VALUES (?, ?)",
-                (gid, user_id))
+def cmd_join(peer_id, user_id):
+    gid = get_active_game(peer_id)
+    if not gid:
+        return send(peer_id, "🤷‍♂️ В этом чате пока нет активной игры. Напишите «Создать», чтобы начать!")
+    
+    cur.execute("SELECT 1 FROM participants WHERE game_id=? AND user_id=?", (gid, user_id))
+    if cur.fetchone():
+        return send(peer_id, f"Ты уже участвуешь в игре! 🎉")
+
+    cur.execute("INSERT INTO participants (game_id, user_id) VALUES (?, ?)", (gid, user_id))
     conn.commit()
     cur.execute("SELECT COUNT(*) FROM participants WHERE game_id=?", (gid,))
     cnt = cur.fetchone()[0]
-    send(peer_id, f"✅ Ты в игре #{gid}! Всего участников: {cnt}")
+    send(peer_id, f"✅ {get_name(user_id)}, ты в игре! Всего участников: {cnt}")
+
+def cmd_list(peer_id):
+    gid = get_active_game(peer_id)
+    if not gid:
+        return send(peer_id, "Сейчас нет активной игры.")
+    
+    cur.execute("SELECT user_id FROM participants WHERE game_id=?", (gid,))
+    users = [get_name(r[0]) for r in cur.fetchall()]
+    if not users:
+        return send(peer_id, "В игре пока нет участников. Напишите «Участвую»!")
+    
+    msg = f"📋 Участники игры #{gid} ({len(users)} чел.):\n"
+    for i, name in enumerate(users, 1):
+        msg += f"{i}. {name}\n"
+    send(peer_id, msg)
 
 def cmd_wish(peer_id, user_id, text):
     cur.execute(
@@ -90,37 +115,24 @@ def cmd_wish(peer_id, user_id, text):
         (user_id, text)
     )
     conn.commit()
-    send(peer_id, "🎁 Пожелания сохранены.")
+    send(peer_id, "🎁 Твои пожелания сохранены! Твой Тайный Санта их увидит.")
 
-def cmd_my(peer_id, user_id):
-    cur.execute("""
-        SELECT g.id, g.status, g.creator_id
-        FROM games g JOIN participants p ON p.game_id = g.id
-        WHERE p.user_id = ?
-    """, (user_id,))
-    rows = cur.fetchall()
-    if not rows:
-        return send(peer_id, "Ты пока не участвуешь ни в одной игре.")
-    msg = "Твои игры:\n"
-    for gid, status, creator in rows:
-        role = "организатор" if creator == user_id else "участник"
-        msg += f"#{gid} — {status}, {role}\n"
-    send(peer_id, msg)
-
-def cmd_draw(peer_id, user_id, gid):
-    cur.execute("SELECT creator_id, status FROM games WHERE id=?", (gid,))
-    row = cur.fetchone()
-    if not row:
-        return send(peer_id, "❌ Игра не найдена.")
-    if row[0] != user_id:
-        return send(peer_id, "❌ Только организатор может запустить жеребьёвку.")
-    if row[1] != 'open':
-        return send(peer_id, "❌ Жеребьёвка уже проведена.")
+def cmd_draw(peer_id, user_id):
+    gid = get_active_game(peer_id)
+    if not gid:
+        return send(peer_id, "Нет активной игры для жеребьевки.")
+    
+    cur.execute("SELECT creator_id FROM games WHERE id=?", (gid,))
+    creator_id = cur.fetchone()[0]
+    
+    if creator_id != user_id:
+        return send(peer_id, "❌ Только тот, кто создал игру, может запустить жеребьевку.")
 
     cur.execute("SELECT user_id FROM participants WHERE game_id=?", (gid,))
     users = [r[0] for r in cur.fetchall()]
+    
     if len(users) < 2:
-        return send(peer_id, "❌ Нужно минимум 2 участника.")
+        return send(peer_id, "❌ Нужно минимум 2 участника, чтобы провести жеребьевку.")
 
     shuffled = users[:]
     for _ in range(200):
@@ -128,7 +140,7 @@ def cmd_draw(peer_id, user_id, gid):
         if all(a != b for a, b in zip(users, shuffled)):
             break
     else:
-        return send(peer_id, "❌ Не удалось провести жеребьёвку, попробуй ещё раз.")
+        return send(peer_id, "❌ Не удалось провести жеребьевку, попробуйте еще раз.")
 
     for u, t in zip(users, shuffled):
         cur.execute("UPDATE participants SET target_id=? WHERE game_id=? AND user_id=?",
@@ -136,15 +148,21 @@ def cmd_draw(peer_id, user_id, gid):
     cur.execute("UPDATE games SET status='closed' WHERE id=?", (gid,))
     conn.commit()
 
-    # Отправляем результаты В ЛИЧКУ каждому участнику (peer_id = u)
+    # Рассылка в ЛС
+    success_count = 0
     for u, t in zip(users, shuffled):
         cur.execute("SELECT wishlist FROM users WHERE vk_id=?", (t,))
         w = cur.fetchone()
-        wish = (w[0] if w and w[0] else "(не указаны)")
-        send(u, f"🎅 Твой подопечный: {get_name(t)} (vk.com/id{t})\n"
-                f"Пожелания: {wish}")
+        wish = (w[0] if w and w[0] else "Пожелания не указаны 🤷‍♂️")
+        
+        # Отправляем в ЛС (peer_id = u)
+        try:
+            send(u, f"🎅 Твой подопечный: {get_name(t)}\nСсылка: vk.com/id{t}\n\n🎁 Пожелания: {wish}")
+            success_count += 1
+        except Exception as e:
+            print(f"Не удалось отправить сообщение пользователю {u}: {e}")
 
-    send(peer_id, f"✅ Жеребьёвка игры #{gid} проведена! Участники получили сообщения в личку.")
+    send(peer_id, f"✅ Жеребьевка проведена! Результаты отправлены в личные сообщения ({success_count} из {len(users)}). Если кто-то не получил, возможно, у него закрыты ЛС.")
 
 # ---------- Основной цикл ----------
 print("Бот запущен...")
@@ -152,40 +170,49 @@ for event in longpoll.listen():
     if event.type != VkBotEventType.MESSAGE_NEW:
         continue
     
-    # Получаем данные из сообщения
     msg = event.object.message
-    peer_id = msg['peer_id']   # Куда отвечать (в чат или в личку)
-    user_id = msg['from_id']   # Кто написал (для базы данных)
+    peer_id = msg['peer_id']
+    user_id = msg['from_id']
     text = msg['text'].strip()
-
-    # Если это беседа (peer_id больше 2 млрд), очищаем текст от упоминания бота
+    
+    # Очистка от упоминания бота (если пишут через @)
     if peer_id >= 2000000000:
-        # Убираем упоминание вида [club242810690|@santa] из текста
         text = text.replace(f"[club{GROUP_ID}|", "").replace("]", "").strip()
+        # Убираем @club123, если написали просто текстом
+        text = text.replace(f"@club{GROUP_ID}", "").strip()
 
     low = text.lower()
 
-    if low.startswith("/start"):
+    # Умный парсинг команд
+    if any(word in low for word in ["привет", "помощь", "меню", "начать", "start"]):
         cmd_start(peer_id)
-    elif low.startswith("/create"):
+    elif any(word in low for word in ["создать", "новая игра", "старт игру"]):
         cmd_create(peer_id, user_id)
-    elif low.startswith("/join"):
-        parts = text.split(maxsplit=1)
-        if len(parts) < 2 or not parts[1].strip().isdigit():
-            send(peer_id, "Использование: /join <id_игры>")
+    elif any(word in low for word in ["участвую", "запиши", "я в деле", "я в игре", "добавь"]):
+        cmd_join(peer_id, user_id)
+    elif any(word in low for word in ["список", "участники", "кто в игре"]):
+        cmd_list(peer_id)
+    elif any(word in low for word in ["жеребьевка", "жеребьёвка", "распределяй", "поехали"]):
+        cmd_draw(peer_id, user_id)
+    # Обработка пожеланий (ищем фразы "хочу в подарок", "желание" и т.д.)
+    elif any(word in low for word in ["хочу в подарок", "желание", "вишлист", "подарите"]):
+        # Отрезаем вступительные слова, оставляя только суть
+        clean_text = text
+        for phrase in ["хочу в подарок", "желание", "вишлист", "подарите", "я хочу"]:
+            # Заменяем без учета регистра
+            idx = clean_text.lower().find(phrase)
+            if idx != -1:
+                clean_text = clean_text[idx+len(phrase):].strip()
+        
+        if clean_text:
+            cmd_wish(peer_id, user_id, clean_text)
         else:
-            cmd_join(peer_id, user_id, int(parts[1]))
+            send(peer_id, "Напиши, что именно ты хочешь получить. Например: «Хочу в подарок наушники».")
+    
+    # Оставляем поддержку слэш-команд на случай, если кто-то привык
+    elif low.startswith("/join"):
+        cmd_join(peer_id, user_id)
     elif low.startswith("/wish"):
         parts = text.split(maxsplit=1)
-        if len(parts) < 2:
-            send(peer_id, "Использование: /wish <текст пожеланий>")
-        else:
+        if len(parts) > 1:
             cmd_wish(peer_id, user_id, parts[1])
-    elif low.startswith("/my"):
-        cmd_my(peer_id, user_id)
-    elif low.startswith("/draw"):
-        parts = text.split(maxsplit=1)
-        if len(parts) < 2 or not parts[1].strip().isdigit():
-            send(peer_id, "Использование: /draw <id_игры>")
-        else:
-            cmd_draw(peer_id, user_id, int(parts[1]))
