@@ -9,24 +9,31 @@ import time
 import urllib3
 from vk_api.bot_longpoll import VkBotLongPoll, VkBotEventType
 
-# Отключаем предупреждения SSL (GigaChat использует сертификаты НУЦ Минцифры)
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 TOKEN = os.environ.get("VK_TOKEN")
 GROUP_ID = "242810690"
 GIGACHAT_AUTH_KEY = os.environ.get("GIGACHAT_AUTH_KEY")
 
-# Глобальные переменные для токена GigaChat
 GIGACHAT_TOKEN = None
 TOKEN_EXPIRES_AT = 0
 
-# --- БАЗА ДАННЫХ (для Тайного Санты) ---
+# --- БАЗА ДАННЫХ ---
 conn = sqlite3.connect("santa.db")
 cur = conn.cursor()
 cur.executescript("""
 CREATE TABLE IF NOT EXISTS users (vk_id INTEGER PRIMARY KEY, wishlist TEXT DEFAULT '');
 CREATE TABLE IF NOT EXISTS games (id INTEGER PRIMARY KEY AUTOINCREMENT, creator_id INTEGER, peer_id INTEGER, status TEXT DEFAULT 'open');
 CREATE TABLE IF NOT EXISTS participants (game_id INTEGER, user_id INTEGER, target_id INTEGER, PRIMARY KEY (game_id, user_id));
+-- Новая таблица для хранения истории сообщений
+CREATE TABLE IF NOT EXISTS chat_messages (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    peer_id INTEGER,
+    user_id INTEGER,
+    user_name TEXT,
+    text TEXT,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
 """)
 conn.commit()
 
@@ -59,22 +66,14 @@ def get_active_game(peer_id):
     row = cur.fetchone()
     return row[0] if row else None
 
-# --- ФУНКЦИИ ВЫЖИМКИ GIGACHAT ---
+# --- ВЫЖИМКА (из БД) ---
 def get_gigachat_token():
     global GIGACHAT_TOKEN, TOKEN_EXPIRES_AT
-    # Если токен есть и он не истекает в ближайшую минуту, используем его
     if GIGACHAT_TOKEN and time.time() * 1000 < TOKEN_EXPIRES_AT - 60000:
         return GIGACHAT_TOKEN
-
     url = "https://ngw.devices.sberbank.ru:9443/api/v2/oauth"
     payload = 'scope=GIGACHAT_API_PERS'
-    headers = {
-        'Content-Type': 'application/x-www-form-urlencoded',
-        'Accept': 'application/json',
-        'RqUID': str(uuid.uuid4()),
-        'Authorization': f'Basic {GIGACHAT_AUTH_KEY}'
-    }
-    
+    headers = {'Content-Type': 'application/x-www-form-urlencoded', 'Accept': 'application/json', 'RqUID': str(uuid.uuid4()), 'Authorization': f'Basic {GIGACHAT_AUTH_KEY}'}
     try:
         response = requests.post(url, headers=headers, data=payload, verify=False)
         response.raise_for_status()
@@ -86,47 +85,14 @@ def get_gigachat_token():
         print(f"Ошибка авторизации GigaChat: {e}")
         return None
 
-def get_chat_history(peer_id, count=100):
-    try:
-        history = vk.messages.getHistory(peer_id=peer_id, count=count, rev=1)
-        chat_log = []
-        for msg in history['items']:
-            if msg['from_id'] < 0: continue
-            text = msg.get('text', '').strip()
-            if text:
-                user_name = get_name(msg['from_id'])
-                chat_log.append(f"{user_name}: {text}")
-        return "\n".join(chat_log)
-    except Exception as e:
-        print(f"Ошибка истории: {e}")
-        return None
-
 def ask_ai_summary(chat_text):
-    if not GIGACHAT_AUTH_KEY:
-        return "❌ Ошибка: Не настроен ключ GIGACHAT_AUTH_KEY."
-    if not chat_text:
-        return "❌ В чате слишком мало сообщений для анализа."
-
+    if not GIGACHAT_AUTH_KEY: return "❌ Ошибка: Не настроен ключ GIGACHAT_AUTH_KEY."
+    if not chat_text: return "❌ В чате слишком мало сообщений для анализа."
     token = get_gigachat_token()
-    if not token:
-        return "❌ Не удалось авторизоваться в GigaChat. Проверьте ключ."
-
+    if not token: return "❌ Не удалось авторизоваться в GigaChat."
     url = "https://gigachat.devices.sberbank.ru/api/v1/chat/completions"
-    payload = json.dumps({
-        "model": "GigaChat",
-        "messages": [
-            {"role": "system", "content": "Ты — полезный ассистент. Сделай краткую выжимку диалога. Выдели главные темы, решения и задачи. Пиши кратко и структурированно."},
-            {"role": "user", "content": f"Вот диалог:\n\n{chat_text}"}
-        ],
-        "temperature": 0.7
-    })
-    
-    headers = {
-        'Content-Type': 'application/json',
-        'Accept': 'application/json',
-        'Authorization': f'Bearer {token}'
-    }
-
+    payload = json.dumps({"model": "GigaChat", "messages": [{"role": "system", "content": "Ты — полезный ассистент. Сделай краткую выжимку диалога. Выдели главные темы, решения и задачи. Пиши кратко и структурированно."}, {"role": "user", "content": f"Вот диалог:\n\n{chat_text}"}], "temperature": 0.7})
+    headers = {'Content-Type': 'application/json', 'Accept': 'application/json', 'Authorization': f'Bearer {token}'}
     try:
         response = requests.post(url, headers=headers, data=payload, verify=False, timeout=60)
         response.raise_for_status()
@@ -135,11 +101,9 @@ def ask_ai_summary(chat_text):
         print(f"Ошибка GigaChat API: {e}")
         return "🤖 Нейросеть не смогла обработать запрос. Попробуйте позже."
 
-# --- КОМАНДЫ САНТЫ ---
+# --- КОМАНДЫ САНТЫ (без изменений) ---
 def cmd_start(peer_id):
-    send(peer_id, "Привет! Я умею две вещи:\n"
-                  "🎅 Тайный Санта (команды: Создать, Участвую, Хочу, Список, Жеребьевка)\n"
-                  "📊 Выжимка чата (напиши «че тут?»)")
+    send(peer_id, "Привет! Я умею две вещи:\n🎅 Тайный Санта (Создать, Участвую, Хочу, Список, Жеребьевка)\n📊 Выжимка чата (напиши «че тут?»)")
 
 def cmd_create(peer_id, user_id):
     active = get_active_game(peer_id)
@@ -164,8 +128,7 @@ def cmd_list(peer_id):
     cur.execute("SELECT user_id FROM participants WHERE game_id=?", (gid,))
     users = [get_name(r[0]) for r in cur.fetchall()]
     if not users: return send(peer_id, "Пока никто не записался.")
-    msg = f"📋 Участники ({len(users)}):\n" + "\n".join([f"{i}. {n}" for i, n in enumerate(users, 1)])
-    send(peer_id, msg)
+    send(peer_id, f"📋 Участники ({len(users)}):\n" + "\n".join([f"{i}. {n}" for i, n in enumerate(users, 1)]))
 
 def cmd_wish(peer_id, user_id, text):
     cur.execute("INSERT INTO users (vk_id, wishlist) VALUES (?, ?) ON CONFLICT(vk_id) DO UPDATE SET wishlist=excluded.wishlist", (user_id, text))
@@ -177,22 +140,18 @@ def cmd_draw(peer_id, user_id):
     if not gid: return send(peer_id, "Нет активной игры.")
     cur.execute("SELECT creator_id FROM games WHERE id=?", (gid,))
     if cur.fetchone()[0] != user_id: return send(peer_id, "❌ Только создатель игры может запустить жеребьевку.")
-    
     cur.execute("SELECT user_id FROM participants WHERE game_id=?", (gid,))
     users = [r[0] for r in cur.fetchall()]
     if len(users) < 2: return send(peer_id, "❌ Нужно минимум 2 участника.")
-
     shuffled = users[:]
     for _ in range(200):
         random.shuffle(shuffled)
         if all(a != b for a, b in zip(users, shuffled)): break
     else: return send(peer_id, "❌ Ошибка жеребьевки.")
-
     for u, t in zip(users, shuffled):
         cur.execute("UPDATE participants SET target_id=? WHERE game_id=? AND user_id=?", (t, gid, u))
     cur.execute("UPDATE games SET status='closed' WHERE id=?", (gid,))
     conn.commit()
-
     success = 0
     for u, t in zip(users, shuffled):
         cur.execute("SELECT wishlist FROM users WHERE vk_id=?", (t,))
@@ -208,31 +167,42 @@ def cmd_draw(peer_id, user_id):
 print("Бот запущен...")
 for event in longpoll.listen():
     if event.type != VkBotEventType.MESSAGE_NEW: continue
-    
     msg = event.object.message
     peer_id = msg['peer_id']
     user_id = msg['from_id']
     text = msg['text'].strip()
     
+    # Очистка от упоминаний
     if peer_id >= 2000000000:
         text = text.replace(f"[club{GROUP_ID}|", "").replace("]", "").replace(f"@club{GROUP_ID}", "").strip()
 
+    # --- СОХРАНЯЕМ СООБЩЕНИЕ В БАЗУ (если это беседа и не от бота) ---
+    if peer_id >= 2000000000 and user_id > 0:
+        user_name = get_name(user_id)
+        cur.execute("INSERT INTO chat_messages (peer_id, user_id, user_name, text) VALUES (?, ?, ?, ?)",
+                    (peer_id, user_id, user_name, text))
+        conn.commit()
+
     low = text.lower()
 
-    # --- ЛОГИКА ВЫЖИМКИ (Команда "че тут?") ---
+    # --- ЛОГИКА ВЫЖИМКИ (теперь из БД) ---
     if any(w in low for w in ["че тут", "что тут", "выжимка", "сводка", "summary"]):
         if peer_id < 2000000000:
             send(peer_id, "Выжимку можно делать только в общем чате (беседе)!")
         else:
-            send(peer_id, "⏳ Читаю последние 100 сообщений и анализирую...")
-            history = get_chat_history(peer_id, count=100)
-            if history:
-                summary = ask_ai_summary(history)
-                send(peer_id, f"📊 **Выжимка чата:**\n\n{summary}")
+            send(peer_id, "⏳ Анализирую последние сообщения...")
+            # Берем 100 последних сообщений из базы
+            cur.execute("SELECT user_name, text FROM chat_messages WHERE peer_id = ? ORDER BY id DESC LIMIT 100", (peer_id,))
+            rows = cur.fetchall()
+            if not rows:
+                send(peer_id, "❌ В этом чате пока нет сохраненных сообщений. Напишите что-нибудь!")
             else:
-                send(peer_id, "❌ Не смог прочитать историю. Убедитесь, что я админ в этом чате!")
+                # Разворачиваем, чтобы было в хронологическом порядке
+                history_text = "\n".join([f"{name}: {txt}" for name, txt in reversed(rows)])
+                summary = ask_ai_summary(history_text)
+                send(peer_id, f"📊 **Выжимка чата:**\n\n{summary}")
 
-    # --- ЛОГИКА САНТЫ ---
+    # --- ОСТАЛЬНЫЕ КОМАНДЫ ---
     elif any(w in low for w in ["привет", "помощь", "меню", "начать", "start"]):
         cmd_start(peer_id)
     elif any(w in low for w in ["создать", "новая игра"]):
