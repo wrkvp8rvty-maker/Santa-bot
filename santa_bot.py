@@ -3,11 +3,22 @@ import sqlite3
 import random
 import vk_api
 import requests
+import json
+import uuid
+import time
+import urllib3
 from vk_api.bot_longpoll import VkBotLongPoll, VkBotEventType
+
+# Отключаем предупреждения SSL (GigaChat использует сертификаты НУЦ Минцифры)
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 TOKEN = os.environ.get("VK_TOKEN")
 GROUP_ID = "242810690"
-AI_KEY = os.environ.get("OPENROUTER_API_KEY") # Ключ от нейросети
+GIGACHAT_AUTH_KEY = os.environ.get("GIGACHAT_AUTH_KEY")
+
+# Глобальные переменные для токена GigaChat
+GIGACHAT_TOKEN = None
+TOKEN_EXPIRES_AT = 0
 
 # --- БАЗА ДАННЫХ (для Тайного Санты) ---
 conn = sqlite3.connect("santa.db")
@@ -48,16 +59,39 @@ def get_active_game(peer_id):
     row = cur.fetchone()
     return row[0] if row else None
 
-# --- ФУНКЦИИ ВЫЖИМКИ ---
+# --- ФУНКЦИИ ВЫЖИМКИ GIGACHAT ---
+def get_gigachat_token():
+    global GIGACHAT_TOKEN, TOKEN_EXPIRES_AT
+    # Если токен есть и он не истекает в ближайшую минуту, используем его
+    if GIGACHAT_TOKEN and time.time() * 1000 < TOKEN_EXPIRES_AT - 60000:
+        return GIGACHAT_TOKEN
+
+    url = "https://ngw.devices.sberbank.ru:9443/api/v2/oauth"
+    payload = 'scope=GIGACHAT_API_PERS'
+    headers = {
+        'Content-Type': 'application/x-www-form-urlencoded',
+        'Accept': 'application/json',
+        'RqUID': str(uuid.uuid4()),
+        'Authorization': f'Basic {GIGACHAT_AUTH_KEY}'
+    }
+    
+    try:
+        response = requests.post(url, headers=headers, data=payload, verify=False)
+        response.raise_for_status()
+        data = response.json()
+        GIGACHAT_TOKEN = data['access_token']
+        TOKEN_EXPIRES_AT = data['expires_at']
+        return GIGACHAT_TOKEN
+    except Exception as e:
+        print(f"Ошибка авторизации GigaChat: {e}")
+        return None
+
 def get_chat_history(peer_id, count=100):
     try:
-        # Получаем ровно 100 последних сообщений
         history = vk.messages.getHistory(peer_id=peer_id, count=count, rev=1)
         chat_log = []
         for msg in history['items']:
-            # Пропускаем сообщения от самого бота
-            if msg['from_id'] < 0:
-                continue
+            if msg['from_id'] < 0: continue
             text = msg.get('text', '').strip()
             if text:
                 user_name = get_name(msg['from_id'])
@@ -68,30 +102,38 @@ def get_chat_history(peer_id, count=100):
         return None
 
 def ask_ai_summary(chat_text):
-    if not AI_KEY:
-        return "❌ Ошибка: Не настроен ключ OPENROUTER_API_KEY в Infrlo."
+    if not GIGACHAT_AUTH_KEY:
+        return "❌ Ошибка: Не настроен ключ GIGACHAT_AUTH_KEY."
     if not chat_text:
         return "❌ В чате слишком мало сообщений для анализа."
 
-    headers = {
-        "Authorization": f"Bearer {AI_KEY}",
-        "Content-Type": "application/json"
-    }
-    data = {
-        "model": "deepseek/deepseek-chat:free", 
+    token = get_gigachat_token()
+    if not token:
+        return "❌ Не удалось авторизоваться в GigaChat. Проверьте ключ."
+
+    url = "https://gigachat.devices.sberbank.ru/api/v1/chat/completions"
+    payload = json.dumps({
+        "model": "GigaChat",
         "messages": [
-            {"role": "system", "content": "Ты — полезный ассистент. Сделай краткую выжимку диалога из чата. Выдели о чем говорят люди, какие главные темы, решения и задачи. Пиши кратко, по делу и структурированно."},
-            {"role": "user", "content": f"Вот последние 100 сообщений из чата:\n\n{chat_text}"}
-        ]
+            {"role": "system", "content": "Ты — полезный ассистент. Сделай краткую выжимку диалога. Выдели главные темы, решения и задачи. Пиши кратко и структурированно."},
+            {"role": "user", "content": f"Вот диалог:\n\n{chat_text}"}
+        ],
+        "temperature": 0.7
+    })
+    
+    headers = {
+        'Content-Type': 'application/json',
+        'Accept': 'application/json',
+        'Authorization': f'Bearer {token}'
     }
 
     try:
-        response = requests.post("https://openrouter.ai/api/v1/chat/completions", headers=headers, json=data, timeout=60)
+        response = requests.post(url, headers=headers, data=payload, verify=False, timeout=60)
         response.raise_for_status()
-        return response.json()["choices"][0]["message"]["content"]
+        return response.json()['choices'][0]['message']['content']
     except Exception as e:
-        print(f"Ошибка ИИ: {e}")
-        return "🤖 Нейросеть сейчас перегружена или не отвечает. Попробуйте через минуту."
+        print(f"Ошибка GigaChat API: {e}")
+        return "🤖 Нейросеть не смогла обработать запрос. Попробуйте позже."
 
 # --- КОМАНДЫ САНТЫ ---
 def cmd_start(peer_id):
@@ -172,7 +214,6 @@ for event in longpoll.listen():
     user_id = msg['from_id']
     text = msg['text'].strip()
     
-    # Очистка от упоминаний в беседе
     if peer_id >= 2000000000:
         text = text.replace(f"[club{GROUP_ID}|", "").replace("]", "").replace(f"@club{GROUP_ID}", "").strip()
 
@@ -184,7 +225,7 @@ for event in longpoll.listen():
             send(peer_id, "Выжимку можно делать только в общем чате (беседе)!")
         else:
             send(peer_id, "⏳ Читаю последние 100 сообщений и анализирую...")
-            history = get_chat_history(peer_id, count=100) # Берем ровно 100
+            history = get_chat_history(peer_id, count=100)
             if history:
                 summary = ask_ai_summary(history)
                 send(peer_id, f"📊 **Выжимка чата:**\n\n{summary}")
