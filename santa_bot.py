@@ -22,7 +22,6 @@ TOKEN_EXPIRES_AT = 0
 # --- БАЗА ДАННЫХ ---
 conn = sqlite3.connect("santa.db")
 cur = conn.cursor()
-# Убрали wishlist, оставили только address
 cur.executescript("""
 CREATE TABLE IF NOT EXISTS users (
     vk_id INTEGER PRIMARY KEY, 
@@ -151,22 +150,43 @@ def ask_ai_summary(chat_text):
 def cmd_start(peer_id):
     send(peer_id, "Привет! Я ELF. 🤖 Вот что я умею:\n\n"
                   "🎅 ТАЙНЫЙ САНТА:\n"
-                  "«Вступить [ваш адрес]» — чтобы участвовать (первый становится организатором).\n"
-                  "«Жеребьевка» — распределить подарки (только организатор).\n"
-                  "«Начать заново» — сбросить игру и начать новую (только организатор).\n\n"
+                  "/организатор — создать игру и стать главным\n"
+                  "«Вступить [адрес ПВЗ]» — записаться в игру\n"
+                  "«Жеребьевка» — распределить подарки (только организатор)\n"
+                  "/показать активную игру — статус и кол-во участников\n"
+                  "«Удалить игру» — сбросить игру (только организатор)\n\n"
                   "📊 НОВОСТНАЯ СВОДКА:\n"
                   "Напиши слово «сводка», и я сделаю выпуск новостей по чату!")
 
-def cmd_join(peer_id, user_id, address):
+def cmd_set_organizer(peer_id, user_id):
+    gid, creator_id = get_active_game(peer_id)
+    if gid:
+        if creator_id == user_id:
+            return send(peer_id, "Ты уже являешься организатором этой игры.")
+        else:
+            return send(peer_id, f"❌ В этом чате уже есть активная игра. Организатор: {get_name(creator_id)}")
+    
+    cur.execute("INSERT INTO games (creator_id, peer_id) VALUES (?, ?)", (user_id, peer_id))
+    conn.commit()
+    send(peer_id, f"👑 {get_name(user_id)} назначен организатором!\n"
+                  f"Теперь участники могут вступать в игру командой:\n"
+                  f"«Вступить [ваш адрес ПВЗ]»")
+
+def cmd_join(peer_id, user_id, text):
     gid, creator_id = get_active_game(peer_id)
     
-    # Если игры нет - создаем её автоматически
     if not gid:
-        cur.execute("INSERT INTO games (creator_id, peer_id) VALUES (?, ?)", (user_id, peer_id))
-        conn.commit()
-        gid = cur.lastrowid
-        send(peer_id, f"✅ Игра создана! {get_name(user_id)} — ты организатор.\n"
-                      f"Теперь остальные пишите «Вступить [ваш адрес]».")
+        return send(peer_id, "🤷‍♂️ В чате нет активной игры. Дождитесь, пока организатор напишет /организатор.")
+
+    # Извлекаем адрес, отрезая команды
+    address = text
+    for w in ["вступить", "участвую", "я в деле"]:
+        if address.lower().startswith(w):
+            address = address[len(w):].strip(" :,-")
+            break
+            
+    if not address:
+        return send(peer_id, "⚠️ Чтобы вступить в игру, обязательно укажи адрес ПВЗ.\nПример: «Вступить: г. Москва, ул. Ленина 1, Озон»")
 
     # Сохраняем адрес
     cur.execute("INSERT INTO users (vk_id, address) VALUES (?, ?) ON CONFLICT(vk_id) DO UPDATE SET address=excluded.address", (user_id, address))
@@ -174,17 +194,17 @@ def cmd_join(peer_id, user_id, address):
     cur.execute("SELECT 1 FROM participants WHERE game_id=? AND user_id=?", (gid, user_id))
     if cur.fetchone(): 
         conn.commit()
-        return send(peer_id, "Ты уже в игре! 🎉 Твой адрес обновлен.")
+        return send(peer_id, "Ты уже в игре! 🎉 (Адрес ПВЗ обновлен)")
     
     cur.execute("INSERT INTO participants (game_id, user_id) VALUES (?, ?)", (gid, user_id))
     conn.commit()
     cur.execute("SELECT COUNT(*) FROM participants WHERE game_id=?", (gid,))
     send(peer_id, f"✅ {get_name(user_id)}, ты в игре! Всего участников: {cur.fetchone()[0]}.\n"
-                  f"📍 Твой адрес сохранен.")
+                  f"📍 Адрес ПВЗ сохранен.")
 
 def cmd_draw(peer_id, user_id):
     gid, creator_id = get_active_game(peer_id)
-    if not gid: return send(peer_id, "Нет активной игры. Напишите «Вступить [ваш адрес]», чтобы начать.")
+    if not gid: return send(peer_id, "Нет активной игры.")
     
     if creator_id != user_id: return send(peer_id, "❌ Только организатор игры может запустить жеребьевку.")
     
@@ -207,28 +227,41 @@ def cmd_draw(peer_id, user_id):
     for u, t in zip(users, shuffled):
         cur.execute("SELECT address FROM users WHERE vk_id=?", (t,))
         w = cur.fetchone()
-        
         address = (w[0] if w and w[0] else "❌ Участник не указал адрес! Свяжитесь с ним.")
         
         try:
             send(u, f"🎅 Твой подопечный: {get_name(t)}\nСсылка: vk.com/id{t}\n\n"
-                    f"📍 Адрес для отправки:\n{address}")
+                    f"📍 Адрес ПВЗ для отправки:\n{address}")
             success += 1
         except: pass
         
     send(peer_id, f"✅ Жеребьевка проведена! Результаты отправлены в ЛС ({success} из {len(users)}).")
 
-def cmd_restart(peer_id, user_id):
+def cmd_show_game(peer_id):
     gid, creator_id = get_active_game(peer_id)
     if not gid:
-        return send(peer_id, "Нет активной игры, которую нужно сбрасывать.")
+        return send(peer_id, "В чате нет активной игры.")
+    
+    cur.execute("SELECT COUNT(*) FROM participants WHERE game_id=?", (gid,))
+    count = cur.fetchone()[0]
+    
+    send(peer_id, f"🎮 Активная игра\n"
+                  f"👑 Организатор: {get_name(creator_id)}\n"
+                  f"👥 Участников: {count}\n\n"
+                  f"Чтобы вступить, напишите «Вступить [адрес ПВЗ]».")
+
+def cmd_delete_game(peer_id, user_id):
+    gid, creator_id = get_active_game(peer_id)
+    if not gid:
+        return send(peer_id, "Нет активной игры для удаления.")
     
     if creator_id != user_id:
-        return send(peer_id, "❌ Только создатель игры может начать её заново.")
+        return send(peer_id, "❌ Только организатор может удалить игру.")
         
-    cur.execute("UPDATE games SET status='closed' WHERE id=?", (gid,))
+    cur.execute("DELETE FROM participants WHERE game_id=?", (gid,))
+    cur.execute("DELETE FROM games WHERE id=?", (gid,))
     conn.commit()
-    send(peer_id, "🔄 Старая игра сброшена!\nЧтобы начать новую, напишите «Вступить [ваш адрес]».")
+    send(peer_id, "🗑 Игра удалена! Чтобы начать новую, напишите /организатор.")
 
 # --- ОСНОВНОЙ ЦИКЛ ---
 print("Бот запущен...")
@@ -271,23 +304,13 @@ for event in longpoll.listen():
     # --- ЛОГИКА САНТЫ ---
     elif any(w in low for w in ["привет", "помощь", "меню", "start"]):
         cmd_start(peer_id)
-        
-    elif any(w in low for w in ["начать заново", "сброс", "перезапуск", "заново"]):
-        cmd_restart(peer_id, user_id)
-        
+    elif "организатор" in low:
+        cmd_set_organizer(peer_id, user_id)
+    elif "показать активную игру" in low:
+        cmd_show_game(peer_id)
+    elif "удалить игру" in low:
+        cmd_delete_game(peer_id, user_id)
     elif any(w in low for w in ["жеребьевка", "жеребьёвка", "распределяй"]):
         cmd_draw(peer_id, user_id)
-        
-    # Обработка "Вступить" с адресом
     elif any(low.startswith(w) for w in ["вступить", "участвую", "я в деле"]):
-        # Извлекаем адрес, отрезая само слово "Вступить"
-        address = text
-        for w in ["вступить", "участвую", "я в деле"]:
-            if address.lower().startswith(w):
-                address = address[len(w):].strip(" :,-")
-                break
-        
-        if not address:
-            send(peer_id, "Чтобы вступить в игру, напиши свой адрес сразу после команды. Например:\n«Вступить: г. Москва, ул. Ленина 1»")
-        else:
-            cmd_join(peer_id, user_id, address)
+        cmd_join(peer_id, user_id, text)
