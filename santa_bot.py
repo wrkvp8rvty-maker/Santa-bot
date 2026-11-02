@@ -57,9 +57,14 @@ longpoll = VkBotLongPoll(vk_session, GROUP_ID)
 
 names_cache = {}
 
-def send(peer_id, text):
+def send(peer_id, text, attachment=None):
     try:
-        vk.messages.send(peer_id=peer_id, message=text, random_id=int(time.time() * 1000))
+        vk.messages.send(
+            peer_id=peer_id, 
+            message=text, 
+            attachment=attachment,
+            random_id=int(time.time() * 1000)
+        )
     except Exception as e:
         print(f"Ошибка отправки: {e}")
 
@@ -79,7 +84,7 @@ def get_active_game(peer_id):
     row = cur.fetchone()
     return row if row else (None, None)
 
-# --- ФУНКЦИИ ВЫЖИМКИ GIGACHAT (БЕЗ ИЗМЕНЕНИЙ) ---
+# --- ФУНКЦИИ ВЫЖИМКИ GIGACHAT ---
 def get_gigachat_token():
     global GIGACHAT_TOKEN, TOKEN_EXPIRES_AT
     if GIGACHAT_TOKEN and time.time() * 1000 < TOKEN_EXPIRES_AT - 60000:
@@ -150,13 +155,36 @@ def ask_ai_summary(chat_text):
 def cmd_start(peer_id):
     send(peer_id, "Привет! Я ELF. 🤖 Вот что я умею:\n\n"
                   "🎅 ТАЙНЫЙ САНТА:\n"
-                  "/организатор — создать игру и стать главным\n"
-                  "«Вступить [адрес ПВЗ]» — записаться в игру\n"
-                  "«Жеребьевка» — распределить подарки (только организатор)\n"
-                  "/показать активную игру — статус и кол-во участников\n"
-                  "«Удалить игру» — сбросить игру (только организатор)\n\n"
+                  "/организатор — создать игру\n"
+                  "/вступить [адрес ПВЗ] — записаться в игру\n"
+                  "/жеребьевка — распределить подарки\n"
+                  "/игра — статус активной игры\n"
+                  "/удалить — сбросить игру\n"
+                  "/правила — инструкция для участников\n\n"
+                  "📦 ОТПРАВКА QR-КОДА:\n"
+                  "Просто отправь мне в ЛС фото QR-кода, и я перешлю его твоему подопечному!\n\n"
                   "📊 НОВОСТНАЯ СВОДКА:\n"
-                  "Напиши слово «сводка», и я сделаю выпуск новостей по чату!")
+                  "/сводка — сделаю выпуск новостей по чату.")
+
+def cmd_rules(peer_id):
+    rules_text = (
+        "📜 ПРАВИЛА ИГРЫ «ТАЙНЫЙ САНТА» 📜\n\n"
+        "1️⃣ ВСТУПЛЕНИЕ В ИГРУ\n"
+        "Напишите в чат: /вступить [ваш адрес ПВЗ]\n"
+        "Пример: /вступить: г. Москва, ул. Ленина 1, ПВЗ Озон.\n"
+        "Важно: без адреса бот не запишет вас в игру!\n\n"
+        "2️⃣ ЖЕРЕБЬЕВКА\n"
+        "Когда все соберутся, организатор пишет /жеребьевка.\n"
+        "Каждому в личные сообщения (ЛС) придет имя, ссылка и адрес вашего подопечного.\n\n"
+        "3️⃣ ОТПРАВКА ПОДАРКА\n"
+        "Купите подарок и отправьте его через ПВЗ на адрес подопечного.\n"
+        "Получив в приложении доставки QR-код для выдачи посылки...\n\n"
+        "4️⃣ КУДА ОТПРАВЛЯТЬ QR-КОД?\n"
+        "❗️ НЕ отправляйте QR-код в общий чат! Это испортит сюрприз.\n"
+        "Отправьте фото (скриншот) QR-кода боту в ЛИЧНЫЕ СООБЩЕНИЯ.\n"
+        "Бот автоматически перешлет его вашему подопечному, сохранив полную анонимность!"
+    )
+    send(peer_id, rules_text)
 
 def cmd_set_organizer(peer_id, user_id):
     gid, creator_id = get_active_game(peer_id)
@@ -170,7 +198,7 @@ def cmd_set_organizer(peer_id, user_id):
     conn.commit()
     send(peer_id, f"👑 {get_name(user_id)} назначен организатором!\n"
                   f"Теперь участники могут вступать в игру командой:\n"
-                  f"«Вступить [ваш адрес ПВЗ]»")
+                  f"/вступить [ваш адрес ПВЗ]")
 
 def cmd_join(peer_id, user_id, text):
     gid, creator_id = get_active_game(peer_id)
@@ -178,17 +206,12 @@ def cmd_join(peer_id, user_id, text):
     if not gid:
         return send(peer_id, "🤷‍♂️ В чате нет активной игры. Дождитесь, пока организатор напишет /организатор.")
 
-    # Извлекаем адрес, отрезая команды
-    address = text
-    for w in ["вступить", "участвую", "я в деле"]:
-        if address.lower().startswith(w):
-            address = address[len(w):].strip(" :,-")
-            break
+    # Отрезаем саму команду /вступить, чтобы получить чистый адрес
+    address = re.sub(r'^/вступить\s*', '', text, flags=re.IGNORECASE).strip(" :,-")
             
     if not address:
-        return send(peer_id, "⚠️ Чтобы вступить в игру, обязательно укажи адрес ПВЗ.\nПример: «Вступить: г. Москва, ул. Ленина 1, Озон»")
+        return send(peer_id, "⚠️ Чтобы вступить в игру, обязательно укажи адрес ПВЗ.\nПример: «/вступить: г. Москва, ул. Ленина 1, Озон»")
 
-    # Сохраняем адрес
     cur.execute("INSERT INTO users (vk_id, address) VALUES (?, ?) ON CONFLICT(vk_id) DO UPDATE SET address=excluded.address", (user_id, address))
     
     cur.execute("SELECT 1 FROM participants WHERE game_id=? AND user_id=?", (gid, user_id))
@@ -231,7 +254,8 @@ def cmd_draw(peer_id, user_id):
         
         try:
             send(u, f"🎅 Твой подопечный: {get_name(t)}\nСсылка: vk.com/id{t}\n\n"
-                    f"📍 Адрес ПВЗ для отправки:\n{address}")
+                    f"📍 Адрес ПВЗ для отправки:\n{address}\n\n"
+                    f"📦 Когда отправишь подарок, отправь мне в ЛС фото QR-кода, и я перешлю его получателю!")
             success += 1
         except: pass
         
@@ -248,7 +272,7 @@ def cmd_show_game(peer_id):
     send(peer_id, f"🎮 Активная игра\n"
                   f"👑 Организатор: {get_name(creator_id)}\n"
                   f"👥 Участников: {count}\n\n"
-                  f"Чтобы вступить, напишите «Вступить [адрес ПВЗ]».")
+                  f"Чтобы вступить, напишите /вступить [адрес ПВЗ].")
 
 def cmd_delete_game(peer_id, user_id):
     gid, creator_id = get_active_game(peer_id)
@@ -285,32 +309,74 @@ for event in longpoll.listen():
 
     low = text.lower()
 
-    # --- ЛОГИКА ВЫЖИМКИ ---
-    clean_low = re.sub(r'[^\w\s]', '', low).strip()
-    if clean_low == "сводка":
-        if peer_id < 2000000000:
-            send(peer_id, "Сводку можно делать только в общем чате!")
-        else:
-            send(peer_id, "🎙 Готовлю выпуск новостей...")
-            cur.execute("SELECT user_name, text FROM chat_messages WHERE peer_id = ? ORDER BY id DESC LIMIT 100", (peer_id,))
-            rows = cur.fetchall()
-            if not rows:
-                send(peer_id, "❌ Тут пока пусто!")
-            else:
-                history_text = "\n".join([f"{name}: {txt}" for name, txt in reversed(rows)])
-                summary = ask_ai_summary(history_text)
-                send(peer_id, f"📺 ВЕЧЕРНИЙ ВЫПУСК:\n\n{summary}")
+    # ==========================================
+    # 1. ОБРАБОТКА ФОТО (QR-КОДЫ В ЛИЧКУ)
+    # ==========================================
+    if 'attachments' in msg and peer_id < 2000000000:
+        for attach in msg['attachments']:
+            if attach['type'] == 'photo':
+                cur.execute("""
+                    SELECT target_id FROM participants 
+                    WHERE user_id = ? AND target_id IS NOT NULL 
+                    ORDER BY game_id DESC LIMIT 1
+                """, (user_id,))
+                row = cur.fetchone()
+                
+                if row:
+                    target_id = row[0]
+                    photo = attach['photo']
+                    attach_str = f"photo{photo['owner_id']}_{photo['id']}"
+                    if 'access_key' in photo:
+                        attach_str += f"_{photo['access_key']}"
+                    
+                    try:
+                        send(target_id, "🎁 Твой Тайный Санта отправил тебе подарок!\n"
+                                        "📦 Вот QR-код для получения посылки:", attachment=attach_str)
+                        send(peer_id, f"✅ Успешно! QR-код отправлен твоему подопечному ({get_name(target_id)}).")
+                    except Exception as e:
+                        send(peer_id, "❌ Не удалось отправить сообщение подопечному. Возможно, у него закрыты личные сообщения.")
+                else:
+                    send(peer_id, "❌ Я не нашел, кому ты даришь подарок. Кажется, ты не участвовал в жеребьевке.")
+                break
 
-    # --- ЛОГИКА САНТЫ ---
-    elif any(w in low for w in ["привет", "помощь", "меню", "start"]):
-        cmd_start(peer_id)
-    elif "организатор" in low:
-        cmd_set_organizer(peer_id, user_id)
-    elif "показать активную игру" in low:
-        cmd_show_game(peer_id)
-    elif "удалить игру" in low:
-        cmd_delete_game(peer_id, user_id)
-    elif any(w in low for w in ["жеребьевка", "жеребьёвка", "распределяй"]):
-        cmd_draw(peer_id, user_id)
-    elif any(low.startswith(w) for w in ["вступить", "участвую", "я в деле"]):
-        cmd_join(peer_id, user_id, text)
+    # ==========================================
+    # 2. ТЕКСТОВЫЕ КОМАНДЫ (ТОЛЬКО С СЛЭШЕМ)
+    # ==========================================
+    if low.startswith("/"):
+        # Очищаем от знаков препинания, чтобы /сводка? тоже работала
+        clean_cmd = re.sub(r'[^\w\s/]', '', low).split()[0]
+
+        if clean_cmd in ["/start", "/помощь", "/меню"]:
+            cmd_start(peer_id)
+            
+        elif clean_cmd == "/сводка":
+            if peer_id < 2000000000:
+                send(peer_id, "Сводку можно делать только в общем чате!")
+            else:
+                send(peer_id, "🎙 Готовлю выпуск новостей...")
+                cur.execute("SELECT user_name, text FROM chat_messages WHERE peer_id = ? ORDER BY id DESC LIMIT 100", (peer_id,))
+                rows = cur.fetchall()
+                if not rows:
+                    send(peer_id, "❌ Тут пока пусто!")
+                else:
+                    history_text = "\n".join([f"{name}: {txt}" for name, txt in reversed(rows)])
+                    summary = ask_ai_summary(history_text)
+                    send(peer_id, f"📺 ВЕЧЕРНИЙ ВЫПУСК:\n\n{summary}")
+                    
+        elif clean_cmd == "/правила":
+            cmd_rules(peer_id)
+            
+        elif clean_cmd == "/организатор":
+            cmd_set_organizer(peer_id, user_id)
+            
+        elif clean_cmd == "/игра":
+            cmd_show_game(peer_id)
+            
+        elif clean_cmd == "/удалить":
+            cmd_delete_game(peer_id, user_id)
+            
+        elif clean_cmd == "/жеребьевка":
+            cmd_draw(peer_id, user_id)
+            
+        elif clean_cmd == "/вступить":
+            cmd_join(peer_id, user_id, text)
