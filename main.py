@@ -24,20 +24,12 @@ if not DATABASE_URL:
 # --- ФУНКЦИЯ ПОДКЛЮЧЕНИЯ К БАЗЕ ---
 def db_connect():
     try:
-        # Добавляем keepalives, чтобы соединение не засыпало
-        connection = psycopg2.connect(
-            DATABASE_URL, 
-            keepalives=1, 
-            keepalives_idle=30, 
-            keepalives_interval=10, 
-            keepalives_count=5
-        )
+        connection = psycopg2.connect(DATABASE_URL, keepalives=1, keepalives_idle=30, keepalives_interval=10, keepalives_count=5)
         return connection, connection.cursor()
     except Exception as e:
         print(f"❌ Ошибка подключения к БД: {e}")
         return None, None
 
-# Инициализация подключения
 conn, cur = db_connect()
 
 if conn:
@@ -49,7 +41,6 @@ if conn:
     """)
     conn.commit()
 
-# --- VK И GIGACHAT ---
 names_cache = {}
 GIGACHAT_TOKEN = None
 TOKEN_EXPIRES_AT = 0
@@ -99,27 +90,67 @@ def ask_ai_summary(chat_text):
         print(f"Ошибка GigaChat API: {e}")
         return "🤖 Ошибка нейросети."
 
-# --- КОМАНДЫ ---
+# --- ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ---
 def send(peer_id, text, attachment=None):
     try:
         vk.messages.send(peer_id=peer_id, message=text, attachment=attachment, random_id=int(time.time() * 1000))
     except Exception as e:
         print(f"Ошибка отправки: {e}")
 
-def get_active_game(peer_id):
-    cur.execute("SELECT id, creator_id FROM games WHERE peer_id = %s AND status = 'open' ORDER BY id DESC LIMIT 1", (peer_id,))
+def get_latest_game(peer_id):
+    cur.execute("SELECT id, creator_id, status FROM games WHERE peer_id = %s ORDER BY id DESC LIMIT 1", (peer_id,))
     row = cur.fetchone()
-    return row if row else (None, None)
+    return row if row else (None, None, None)
 
+def send_target_info(user_id, target_id):
+    cur.execute("SELECT address FROM users WHERE vk_id=%s", (target_id,))
+    w = cur.fetchone()
+    address = (w[0] if w and w[0] else "❌ Не указан адрес.")
+    try:
+        send(user_id, f"🎅 Твой подопечный: {get_name(target_id)}\nСсылка: vk.com/id{target_id}\n📍 Адрес: {address}\n📦 QR-код кидай мне в ЛС!")
+    except Exception as e:
+        print(f"Не удалось отправить сообщение {user_id}: {e}")
+
+def extract_vk_id(text):
+    m1 = re.search(r'\[id(\d+)\|', text)
+    m2 = re.search(r'@id(\d+)', text)
+    m3 = re.search(r'vk\.com/id(\d+)', text)
+    m4 = re.search(r'vk\.com/([a-zA-Z0-9_.]+)', text)
+    m5 = re.search(r'\b(\d{5,})\b', text)
+    
+    if m1: return int(m1.group(1))
+    if m2: return int(m2.group(1))
+    if m3: return int(m3.group(1))
+    if m5: return int(m5.group(1))
+    if m4:
+        try:
+            res = vk.users.get(user_ids=m4.group(1))
+            if res: return res[0]['id']
+        except: pass
+    return None
+
+# --- КОМАНДЫ ---
 def cmd_start(peer_id):
-    send(peer_id, "Привет! Я ELF. 🤖\n\n🎅 ТАЙНЫЙ САНТА:\n/organizator — создать игру\n/vstupit [адрес ПВЗ] — записаться\n/zherebevka — распределить подарки\n/igra — статус игры\n/udalit — сбросить игру\n/pravila — инструкция\n\n📦 QR-КОД: отправь мне в ЛС фото QR-кода.\n\n📊 СВОДКА: /svodka")
+    send(peer_id, "Привет! Я ELF. 🤖\n\n"
+                  "🎅 ТАЙНЫЙ САНТА:\n"
+                  "/организатор — создать игру\n"
+                  "/вступить [адрес ПВЗ] — записаться\n"
+                  "/участники — список участников\n"
+                  "/жеребьевка — провести жеребьевку\n"
+                  "/добор [ссылка] — вписать опоздавших\n"
+                  "/отмена — отменить жеребьевку\n"
+                  "/игра — статус игры\n"
+                  "/удалить — сбросить игру\n"
+                  "/правила — инструкция\n\n"
+                  "📦 QR-КОД: отправь мне в ЛС фото QR-кода.\n\n"
+                  "📊 СВОДКА: /сводка")
 
 def cmd_rules(peer_id):
     send(peer_id, "📜 ПРАВИЛА:\n1️⃣ /вступить [адрес ПВЗ]\n2️⃣ Ждем /жеребьевка от орга\n3️⃣ Отправляем подарок\n4️⃣ QR-код кидаем боту в ЛС (не в чат!)")
 
 def cmd_set_organizer(peer_id, user_id):
-    gid, creator_id = get_active_game(peer_id)
-    if gid:
+    gid, creator_id, status = get_latest_game(peer_id)
+    if gid and status == 'open':
         if creator_id == user_id: return send(peer_id, "Ты уже организатор.")
         else: return send(peer_id, f"❌ Игра уже есть. Орг: {get_name(creator_id)}")
     
@@ -128,27 +159,125 @@ def cmd_set_organizer(peer_id, user_id):
     send(peer_id, f"👑 {get_name(user_id)} — организатор! Пишите /вступить [адрес]")
 
 def cmd_join(peer_id, user_id, text):
-    gid, creator_id = get_active_game(peer_id)
-    if not gid: return send(peer_id, "🤷‍♂️ Нет игры. Ждите /организатор.")
+    gid, creator_id, status = get_latest_game(peer_id)
+    
+    if not gid: 
+        return send(peer_id, "🤷‍♂️ Нет игры. Ждите /организатор.")
     
     address = re.sub(r'^/вступить\s*', '', text, flags=re.IGNORECASE).strip(" :,-")
-    if not address: return send(peer_id, "⚠️ Укажи адрес: /вступить: г. Москва, Озон Ленина 1")
+    if not address: 
+        return send(peer_id, "⚠️ Укажи адрес: /вступить: г. Москва, Озон Ленина 1")
     
     cur.execute("INSERT INTO users (vk_id, address) VALUES (%s, %s) ON CONFLICT (vk_id) DO UPDATE SET address = EXCLUDED.address", (user_id, address))
     
-    cur.execute("SELECT 1 FROM participants WHERE game_id=%s AND user_id=%s", (gid, user_id))
-    if cur.fetchone(): 
+    cur.execute("SELECT target_id FROM participants WHERE game_id=%s AND user_id=%s", (gid, user_id))
+    row = cur.fetchone()
+    
+    if row:
         conn.commit()
+        if row[0] is None and status == 'closed':
+            return send(peer_id, "Ты уже записан как опоздавший! Ждем, пока организатор напишет /добор.")
         return send(peer_id, "Ты уже в игре! Адрес обновлен.")
     
     cur.execute("INSERT INTO participants (game_id, user_id) VALUES (%s, %s)", (gid, user_id))
     conn.commit()
-    cur.execute("SELECT COUNT(*) FROM participants WHERE game_id=%s", (gid,))
-    send(peer_id, f"✅ {get_name(user_id)} в игре! Всего: {cur.fetchone()[0]}")
+    
+    if status == 'closed':
+        send(peer_id, f"✅ {get_name(user_id)}, ты добавлен в список опоздавших!\nОрганизатору нужно написать /добор, чтобы вписать тебя.")
+    else:
+        cur.execute("SELECT COUNT(*) FROM participants WHERE game_id=%s", (gid,))
+        send(peer_id, f"✅ {get_name(user_id)} в игре! Всего: {cur.fetchone()[0]}")
+
+def cmd_show_participants(peer_id):
+    gid, creator_id, status = get_latest_game(peer_id)
+    if not gid: return send(peer_id, "В чате нет игр.")
+    
+    cur.execute("SELECT user_id FROM participants WHERE game_id=%s ORDER BY user_id", (gid,))
+    users = [r[0] for r in cur.fetchall()]
+    
+    if not users:
+        return send(peer_id, "В игре пока нет участников. Напишите /вступить [адрес].")
+    
+    msg = f"📋 Участники игры #{gid} ({len(users)} чел.):\n"
+    for i, u in enumerate(users, 1):
+        is_org = " 👑 (Орг)" if u == creator_id else ""
+        msg += f"{i}. {get_name(u)}{is_org}\n"
+        
+    send(peer_id, msg)
+
+def cmd_add_latecomers(peer_id, user_id, text):
+    gid, creator_id, status = get_latest_game(peer_id)
+    if not gid: return send(peer_id, "Нет игры.")
+    if creator_id != user_id: return send(peer_id, "❌ Только организатор может делать добор.")
+    if status == 'open': return send(peer_id, "Игра еще открыта. Просто напишите /жеребьевка.")
+
+    cur.execute("SELECT user_id FROM participants WHERE game_id=%s AND target_id IS NULL", (gid,))
+    latecomers = [r[0] for r in cur.fetchall()]
+    
+    if not latecomers:
+        return send(peer_id, "Никто не опоздал. Все уже распределены!")
+
+    lucky_id = extract_vk_id(text)
+    
+    if lucky_id:
+        cur.execute("SELECT target_id FROM participants WHERE game_id=%s AND user_id=%s", (gid, lucky_id))
+        row = cur.fetchone()
+        
+        if not row:
+            return send(peer_id, "❌ Этот человек не участвует в игре.")
+        if row[0] is None:
+            return send(peer_id, "❌ У этого человека еще нет подопечного (он сам опоздавший).")
+        if lucky_id in latecomers:
+            return send(peer_id, "❌ Нельзя выбрать опоздавшего счастливчиком.")
+            
+        old_target = row[0]
+        late_user = latecomers[0]
+        
+        cur.execute("UPDATE participants SET target_id=%s WHERE game_id=%s AND user_id=%s", (late_user, gid, lucky_id))
+        cur.execute("UPDATE participants SET target_id=%s WHERE game_id=%s AND user_id=%s", (old_target, gid, late_user))
+        conn.commit()
+        
+        send_target_info(lucky_id, late_user)
+        send_target_info(late_user, old_target)
+        
+        send(peer_id, f"✅ Добор завершен вручную!\n👤 {get_name(lucky_id)} теперь дарит опоздавшему {get_name(late_user)}.\n🎁 А {get_name(late_user)} дарит тому, кому дарил {get_name(lucky_id)}.")
+        
+    else:
+        cur.execute("SELECT user_id, target_id FROM participants WHERE game_id=%s AND target_id IS NOT NULL", (gid,))
+        existing_pairs = cur.fetchall()
+        
+        if len(existing_pairs) < len(latecomers):
+            return send(peer_id, "❌ Опоздавших больше, чем старых участников. Придется делать полную /отмена и /жеребьевка.")
+
+        random.shuffle(existing_pairs)
+        
+        for i, late_user in enumerate(latecomers):
+            old_user, old_target = existing_pairs[i]
+            
+            cur.execute("UPDATE participants SET target_id=%s WHERE game_id=%s AND user_id=%s", (late_user, gid, old_user))
+            cur.execute("UPDATE participants SET target_id=%s WHERE game_id=%s AND user_id=%s", (old_target, gid, late_user))
+            conn.commit()
+            
+            send_target_info(old_user, late_user)
+            send_target_info(late_user, old_target)
+        
+        send(peer_id, f"✅ Случайный добор завершен! Вписали {len(latecomers)} опоздавших.")
+
+def cmd_cancel_draw(peer_id, user_id):
+    gid, creator_id, status = get_latest_game(peer_id)
+    if not gid: return send(peer_id, "🤷‍♂️ В этом чате нет игр.")
+    if creator_id != user_id: return send(peer_id, "❌ Только организатор может отменить жеребьевку.")
+    if status == 'open': return send(peer_id, "Игра и так открыта.")
+    
+    cur.execute("UPDATE games SET status='open' WHERE id=%s", (gid,))
+    cur.execute("UPDATE participants SET target_id=NULL WHERE game_id=%s", (gid,))
+    conn.commit()
+    send(peer_id, "🔄 Жеребьевка полностью отменена! Игра открыта заново.")
 
 def cmd_draw(peer_id, user_id):
-    gid, creator_id = get_active_game(peer_id)
+    gid, creator_id, status = get_latest_game(peer_id)
     if not gid: return send(peer_id, "Нет игры.")
+    if status == 'closed': return send(peer_id, "Жеребьевка уже проведена. Используйте /добор или /отмена.")
     if creator_id != user_id: return send(peer_id, "❌ Только орг может запустить жеребьевку.")
     
     cur.execute("SELECT user_id FROM participants WHERE game_id=%s", (gid,))
@@ -168,43 +297,41 @@ def cmd_draw(peer_id, user_id):
 
     success = 0
     for u, t in zip(users, shuffled):
-        cur.execute("SELECT address FROM users WHERE vk_id=%s", (t,))
-        w = cur.fetchone()
-        address = (w[0] if w and w[0] else "❌ Не указан адрес.")
         try:
-            send(u, f"🎅 Твой подопечный: {get_name(t)}\nСсылка: vk.com/id{t}\n📍 Адрес: {address}\n📦 QR-код кидай мне в ЛС!")
+            send_target_info(u, t)
             success += 1
         except: pass
     send(peer_id, f"✅ Жеребьевка проведена! Отправлено ({success} из {len(users)}).")
 
 def cmd_show_game(peer_id):
-    gid, creator_id = get_active_game(peer_id)
-    if not gid: return send(peer_id, "В чате нет игры.")
+    gid, creator_id, status = get_latest_game(peer_id)
+    if not gid: return send(peer_id, "В чате нет игр.")
+    
     cur.execute("SELECT COUNT(*) FROM participants WHERE game_id=%s", (gid,))
-    send(peer_id, f"🎮 Игра активна.\n👑 Орг: {get_name(creator_id)}\n👥 Участников: {cur.fetchone()[0]}")
+    count = cur.fetchone()[0]
+    
+    status_text = "Открыта (ждем участников)" if status == 'open' else "Закрыта (жеребьевка проведена)"
+    send(peer_id, f"🎮 Игра #{gid}\n👑 Орг: {get_name(creator_id)}\n👥 Участников: {count}\n📌 Статус: {status_text}")
 
 def cmd_delete_game(peer_id, user_id):
-    gid, creator_id = get_active_game(peer_id)
-    if not gid: return send(peer_id, "Нет игры.")
+    gid, creator_id, status = get_latest_game(peer_id)
+    if not gid: return send(peer_id, "Нет игр для удаления.")
     if creator_id != user_id: return send(peer_id, "❌ Только орг может удалить.")
+    
     cur.execute("DELETE FROM participants WHERE game_id=%s", (gid,))
     cur.execute("DELETE FROM games WHERE id=%s", (gid,))
     conn.commit()
-    send(peer_id, "🗑 Игра удалена!")
+    send(peer_id, "🗑 Игра полностью удалена!")
 
-# --- ОСНОВНОЙ ЦИКЛ С ЗАЩИТОЙ ОТ РАЗРЫВА БД ---
+# --- ОСНОВНОЙ ЦИКЛ ---
 print("Бот запущен (Neon Postgres)...")
 while True:
     try:
-        # Если соединение с БД потеряно или не установлено, подключаемся заново
         if not conn or conn.closed:
             print("🔄 Переподключение к базе данных...")
             conn, cur = db_connect()
-            if not conn:
-                time.sleep(5)
-                continue
+            if not conn: time.sleep(5); continue
 
-        # Инициализируем VK (делаем это внутри цикла, чтобы при сбое пересоздать)
         vk_session = vk_api.VkApi(token=TOKEN)
         vk = vk_session.get_api()
         longpoll = VkBotLongPoll(vk_session, GROUP_ID)
@@ -227,6 +354,7 @@ while True:
 
             low = text.lower()
 
+            # Обработка фото (QR-коды)
             if 'attachments' in msg and peer_id < 2000000000:
                 for attach in msg['attachments']:
                     if attach['type'] == 'photo':
@@ -260,6 +388,9 @@ while True:
                             send(peer_id, f"📺 ВЫПУСК:\n\n{ask_ai_summary(history)}")
                 elif clean_cmd in ["/правила", "/pravila"]: cmd_rules(peer_id)
                 elif clean_cmd in ["/организатор", "/organizator"]: cmd_set_organizer(peer_id, user_id)
+                elif clean_cmd in ["/отмена", "/otmena"]: cmd_cancel_draw(peer_id, user_id)
+                elif clean_cmd in ["/добор", "/dobor"]: cmd_add_latecomers(peer_id, user_id, text)
+                elif clean_cmd in ["/участники", "/spisok", "/список"]: cmd_show_participants(peer_id)
                 elif clean_cmd in ["/игра", "/igra"]: cmd_show_game(peer_id)
                 elif clean_cmd in ["/удалить", "/udalit"]: cmd_delete_game(peer_id, user_id)
                 elif clean_cmd in ["/жеребьевка", "/zherebevka"]: cmd_draw(peer_id, user_id)
