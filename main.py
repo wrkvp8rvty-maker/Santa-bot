@@ -21,48 +21,38 @@ if not DATABASE_URL:
     print("⚠️ ВНИМАНИЕ: Не задана переменная DATABASE_URL!")
     exit(1)
 
-conn = psycopg2.connect(DATABASE_URL)
-cur = conn.cursor()
-
-cur.execute("""
-CREATE TABLE IF NOT EXISTS users (
-    vk_id INTEGER PRIMARY KEY, 
-    address TEXT DEFAULT ''
-);
-CREATE TABLE IF NOT EXISTS games (
-    id SERIAL PRIMARY KEY, 
-    creator_id INTEGER, 
-    peer_id INTEGER, 
-    status TEXT DEFAULT 'open'
-);
-CREATE TABLE IF NOT EXISTS participants (
-    game_id INTEGER, 
-    user_id INTEGER, 
-    target_id INTEGER, 
-    PRIMARY KEY (game_id, user_id)
-);
-CREATE TABLE IF NOT EXISTS chat_messages (
-    id SERIAL PRIMARY KEY,
-    peer_id INTEGER,
-    user_id INTEGER,
-    user_name TEXT,
-    text TEXT,
-    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-);
-""")
-conn.commit()
-
-vk_session = vk_api.VkApi(token=TOKEN)
-vk = vk_session.get_api()
-longpoll = VkBotLongPoll(vk_session, GROUP_ID)
-
-names_cache = {}
-
-def send(peer_id, text, attachment=None):
+# --- ФУНКЦИЯ ПОДКЛЮЧЕНИЯ К БАЗЕ ---
+def db_connect():
     try:
-        vk.messages.send(peer_id=peer_id, message=text, attachment=attachment, random_id=int(time.time() * 1000))
+        # Добавляем keepalives, чтобы соединение не засыпало
+        connection = psycopg2.connect(
+            DATABASE_URL, 
+            keepalives=1, 
+            keepalives_idle=30, 
+            keepalives_interval=10, 
+            keepalives_count=5
+        )
+        return connection, connection.cursor()
     except Exception as e:
-        print(f"Ошибка отправки: {e}")
+        print(f"❌ Ошибка подключения к БД: {e}")
+        return None, None
+
+# Инициализация подключения
+conn, cur = db_connect()
+
+if conn:
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS users (vk_id INTEGER PRIMARY KEY, address TEXT DEFAULT '');
+    CREATE TABLE IF NOT EXISTS games (id SERIAL PRIMARY KEY, creator_id INTEGER, peer_id INTEGER, status TEXT DEFAULT 'open');
+    CREATE TABLE IF NOT EXISTS participants (game_id INTEGER, user_id INTEGER, target_id INTEGER, PRIMARY KEY (game_id, user_id));
+    CREATE TABLE IF NOT EXISTS chat_messages (id SERIAL PRIMARY KEY, peer_id INTEGER, user_id INTEGER, user_name TEXT, text TEXT, created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP);
+    """)
+    conn.commit()
+
+# --- VK И GIGACHAT ---
+names_cache = {}
+GIGACHAT_TOKEN = None
+TOKEN_EXPIRES_AT = 0
 
 def get_name(uid):
     if uid in names_cache: return names_cache[uid]
@@ -74,14 +64,9 @@ def get_name(uid):
     except Exception:
         return f"id{uid}"
 
-def get_active_game(peer_id):
-    cur.execute("SELECT id, creator_id FROM games WHERE peer_id = %s AND status = 'open' ORDER BY id DESC LIMIT 1", (peer_id,))
-    row = cur.fetchone()
-    return row if row else (None, None)
-
 def get_gigachat_token():
     global GIGACHAT_TOKEN, TOKEN_EXPIRES_AT
-    if 'GIGACHAT_TOKEN' in globals() and GIGACHAT_TOKEN and time.time() * 1000 < TOKEN_EXPIRES_AT - 60000:
+    if GIGACHAT_TOKEN and time.time() * 1000 < TOKEN_EXPIRES_AT - 60000:
         return GIGACHAT_TOKEN
     url = "https://ngw.devices.sberbank.ru:9443/api/v2/oauth"
     payload = 'scope=GIGACHAT_API_PERS'
@@ -114,17 +99,20 @@ def ask_ai_summary(chat_text):
         print(f"Ошибка GigaChat API: {e}")
         return "🤖 Ошибка нейросети."
 
+# --- КОМАНДЫ ---
+def send(peer_id, text, attachment=None):
+    try:
+        vk.messages.send(peer_id=peer_id, message=text, attachment=attachment, random_id=int(time.time() * 1000))
+    except Exception as e:
+        print(f"Ошибка отправки: {e}")
+
+def get_active_game(peer_id):
+    cur.execute("SELECT id, creator_id FROM games WHERE peer_id = %s AND status = 'open' ORDER BY id DESC LIMIT 1", (peer_id,))
+    row = cur.fetchone()
+    return row if row else (None, None)
+
 def cmd_start(peer_id):
-    send(peer_id, "Привет! Я ELF. 🤖\n\n"
-                  "🎅 ТАЙНЫЙ САНТА:\n"
-                  "/организатор — создать игру\n"
-                  "/вступить [адрес ПВЗ] — записаться\n"
-                  "/жеребьевка — распределить подарки\n"
-                  "/игра — статус игры\n"
-                  "/удалить — сбросить игру\n"
-                  "/правила — инструкция\n\n"
-                  "📦 QR-КОД: отправь мне в ЛС фото QR-кода.\n\n"
-                  "📊 СВОДКА: /сводка")
+    send(peer_id, "Привет! Я ELF. 🤖\n\n🎅 ТАЙНЫЙ САНТА:\n/organizator — создать игру\n/vstupit [адрес ПВЗ] — записаться\n/zherebevka — распределить подарки\n/igra — статус игры\n/udalit — сбросить игру\n/pravila — инструкция\n\n📦 QR-КОД: отправь мне в ЛС фото QR-кода.\n\n📊 СВОДКА: /svodka")
 
 def cmd_rules(peer_id):
     send(peer_id, "📜 ПРАВИЛА:\n1️⃣ /вступить [адрес ПВЗ]\n2️⃣ Ждем /жеребьевка от орга\n3️⃣ Отправляем подарок\n4️⃣ QR-код кидаем боту в ЛС (не в чат!)")
@@ -204,59 +192,83 @@ def cmd_delete_game(peer_id, user_id):
     conn.commit()
     send(peer_id, "🗑 Игра удалена!")
 
+# --- ОСНОВНОЙ ЦИКЛ С ЗАЩИТОЙ ОТ РАЗРЫВА БД ---
 print("Бот запущен (Neon Postgres)...")
-for event in longpoll.listen():
-    if event.type != VkBotEventType.MESSAGE_NEW: continue
-    
-    msg = event.object.message
-    peer_id = msg['peer_id']
-    user_id = msg['from_id']
-    text = msg['text'].strip()
-    
-    if peer_id >= 2000000000:
-        text = text.replace(f"[club{GROUP_ID}|", "").replace("]", "").replace(f"@club{GROUP_ID}", "").strip()
+while True:
+    try:
+        # Если соединение с БД потеряно или не установлено, подключаемся заново
+        if not conn or conn.closed:
+            print("🔄 Переподключение к базе данных...")
+            conn, cur = db_connect()
+            if not conn:
+                time.sleep(5)
+                continue
 
-    if peer_id >= 2000000000 and user_id > 0:
-        user_name = get_name(user_id)
-        cur.execute("INSERT INTO chat_messages (peer_id, user_id, user_name, text) VALUES (%s, %s, %s, %s)", (peer_id, user_id, user_name, text))
-        conn.commit()
+        # Инициализируем VK (делаем это внутри цикла, чтобы при сбое пересоздать)
+        vk_session = vk_api.VkApi(token=TOKEN)
+        vk = vk_session.get_api()
+        longpoll = VkBotLongPoll(vk_session, GROUP_ID)
 
-    low = text.lower()
+        for event in longpoll.listen():
+            if event.type != VkBotEventType.MESSAGE_NEW: continue
+            
+            msg = event.object.message
+            peer_id = msg['peer_id']
+            user_id = msg['from_id']
+            text = msg['text'].strip()
+            
+            if peer_id >= 2000000000:
+                text = text.replace(f"[club{GROUP_ID}|", "").replace("]", "").replace(f"@club{GROUP_ID}", "").strip()
 
-    if 'attachments' in msg and peer_id < 2000000000:
-        for attach in msg['attachments']:
-            if attach['type'] == 'photo':
-                cur.execute("SELECT target_id FROM participants WHERE user_id = %s AND target_id IS NOT NULL ORDER BY game_id DESC LIMIT 1", (user_id,))
-                row = cur.fetchone()
-                if row:
-                    target_id = row[0]
-                    photo = attach['photo']
-                    attach_str = f"photo{photo['owner_id']}_{photo['id']}"
-                    if 'access_key' in photo: attach_str += f"_{photo['access_key']}"
-                    try:
-                        send(target_id, "🎁 Твой Тайный Санта отправил QR-код:", attachment=attach_str)
-                        send(peer_id, f"✅ QR отправлен ({get_name(target_id)})")
-                    except: send(peer_id, "❌ У него закрыты ЛС.")
-                else: send(peer_id, "❌ Ты не участвовал в жеребьевке.")
-                break
+            if peer_id >= 2000000000 and user_id > 0:
+                user_name = get_name(user_id)
+                cur.execute("INSERT INTO chat_messages (peer_id, user_id, user_name, text) VALUES (%s, %s, %s, %s)", (peer_id, user_id, user_name, text))
+                conn.commit()
 
-    if low.startswith("/"):
-        clean_cmd = re.sub(r'[^\w\s/]', '', low).split()[0]
+            low = text.lower()
 
-        if clean_cmd in ["/start", "/помощь", "/меню"]: cmd_start(peer_id)
-        elif clean_cmd == "/сводка":
-            if peer_id < 2000000000: send(peer_id, "Только в чате!")
-            else:
-                send(peer_id, "🎙 Готовлю сводку...")
-                cur.execute("SELECT user_name, text FROM chat_messages WHERE peer_id = %s ORDER BY id DESC LIMIT 100", (peer_id,))
-                rows = cur.fetchall()
-                if not rows: send(peer_id, "❌ Пусто.")
-                else:
-                    history = "\n".join([f"{n}: {t}" for n, t in reversed(rows)])
-                    send(peer_id, f"📺 ВЫПУСК:\n\n{ask_ai_summary(history)}")
-        elif clean_cmd == "/правила": cmd_rules(peer_id)
-        elif clean_cmd == "/организатор": cmd_set_organizer(peer_id, user_id)
-        elif clean_cmd == "/игра": cmd_show_game(peer_id)
-        elif clean_cmd == "/удалить": cmd_delete_game(peer_id, user_id)
-        elif clean_cmd == "/жеребьевка": cmd_draw(peer_id, user_id)
-        elif clean_cmd == "/вступить": cmd_join(peer_id, user_id, text)
+            if 'attachments' in msg and peer_id < 2000000000:
+                for attach in msg['attachments']:
+                    if attach['type'] == 'photo':
+                        cur.execute("SELECT target_id FROM participants WHERE user_id = %s AND target_id IS NOT NULL ORDER BY game_id DESC LIMIT 1", (user_id,))
+                        row = cur.fetchone()
+                        if row:
+                            target_id = row[0]
+                            photo = attach['photo']
+                            attach_str = f"photo{photo['owner_id']}_{photo['id']}"
+                            if 'access_key' in photo: attach_str += f"_{photo['access_key']}"
+                            try:
+                                send(target_id, "🎁 Твой Тайный Санта отправил QR-код:", attachment=attach_str)
+                                send(peer_id, f"✅ QR отправлен ({get_name(target_id)})")
+                            except: send(peer_id, "❌ У него закрыты ЛС.")
+                        else: send(peer_id, "❌ Ты не участвовал в жеребьевке.")
+                        break
+
+            if low.startswith("/"):
+                clean_cmd = re.sub(r'[^\w\s/]', '', low).split()[0]
+
+                if clean_cmd in ["/start", "/помощь", "/меню"]: cmd_start(peer_id)
+                elif clean_cmd in ["/сводка", "/svodka"]:
+                    if peer_id < 2000000000: send(peer_id, "Только в чате!")
+                    else:
+                        send(peer_id, "🎙 Готовлю сводку...")
+                        cur.execute("SELECT user_name, text FROM chat_messages WHERE peer_id = %s ORDER BY id DESC LIMIT 100", (peer_id,))
+                        rows = cur.fetchall()
+                        if not rows: send(peer_id, "❌ Пусто.")
+                        else:
+                            history = "\n".join([f"{n}: {t}" for n, t in reversed(rows)])
+                            send(peer_id, f"📺 ВЫПУСК:\n\n{ask_ai_summary(history)}")
+                elif clean_cmd in ["/правила", "/pravila"]: cmd_rules(peer_id)
+                elif clean_cmd in ["/организатор", "/organizator"]: cmd_set_organizer(peer_id, user_id)
+                elif clean_cmd in ["/игра", "/igra"]: cmd_show_game(peer_id)
+                elif clean_cmd in ["/удалить", "/udalit"]: cmd_delete_game(peer_id, user_id)
+                elif clean_cmd in ["/жеребьевка", "/zherebevka"]: cmd_draw(peer_id, user_id)
+                elif clean_cmd in ["/вступить", "/vstupit"]: cmd_join(peer_id, user_id, text)
+
+    except psycopg2.OperationalError as e:
+        print(f"⚠️ Соединение с БД потеряно: {e}. Переподключаюсь...")
+        conn = None
+        time.sleep(3)
+    except Exception as e:
+        print(f"⚠️ Ошибка в главном цикле: {e}. Перезапуск через 5 секунд...")
+        time.sleep(5)
